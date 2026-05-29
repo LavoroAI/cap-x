@@ -114,6 +114,9 @@ class RobosuiteTwoArmLiftEnv(BaseEnv):
         self.robosuite_env.sim.model.cam_pos[agentview_cam_id] = [1.5, 0.0, 2.5]
         self.robosuite_env.sim.model.cam_quat[agentview_cam_id] = [0.653, 0.271, 0.271, 0.653]
 
+        # Control frequency for the data-collection schema.
+        self._control_freq = int(getattr(self.robosuite_env, "control_freq", 20))
+
         # State tracking
         self._step_count = 0
         self._sim_step_count = 0
@@ -122,7 +125,12 @@ class RobosuiteTwoArmLiftEnv(BaseEnv):
         # Video capture
         self._record_frames = False
         self._frame_buffer: list[np.ndarray] = []
-        self._subsample_rate = 4
+        self._wrist_frame_buffer: list[np.ndarray] = []
+        self._record_wrist_camera = False
+        self._subsample_rate = 1
+
+        # Cached task prompt for get_language_instruction (set in reset()).
+        self._task_prompt: str | None = None
 
         # Robot link indices for transforms (robot0 and robot1)
         # Base links are fixed, so we cache their transforms
@@ -191,6 +199,7 @@ class RobosuiteTwoArmLiftEnv(BaseEnv):
         info = {
             "task_prompt": "Two robotic arms (Panda) should coordinate to lift the pot. Arm 0 should grasp one handle, and Arm 1 should grasp the other handle."
         }
+        self._task_prompt = info["task_prompt"]
         return obs, info
 
     def step(self, action: Any) -> tuple[dict[str, Any], float, bool, bool, dict[str, Any]]:
@@ -238,14 +247,7 @@ class RobosuiteTwoArmLiftEnv(BaseEnv):
 
             # Step the environment
             self.robosuite_env.step(action)
-            self._sim_step_count += 1
-
-            if hasattr(self, "viser_server") and self._sim_step_count % self._subsample_rate == 0:
-                self._update_viser_server()
-
-            if self._record_frames and self._sim_step_count % self._subsample_rate == 0:
-                self._record_frame()
-
+            self._post_step(action)
             steps += 1
 
     def move_to_joints_blocking_arm1(
@@ -279,14 +281,7 @@ class RobosuiteTwoArmLiftEnv(BaseEnv):
 
             # Step the environment
             self.robosuite_env.step(action)
-            self._sim_step_count += 1
-
-            if hasattr(self, "viser_server") and self._sim_step_count % self._subsample_rate == 0:
-                self._update_viser_server()
-
-            if self._record_frames and self._sim_step_count % self._subsample_rate == 0:
-                self._record_frame()
-
+            self._post_step(action)
             steps += 1
 
     def move_to_joints_blocking_both(
@@ -329,14 +324,7 @@ class RobosuiteTwoArmLiftEnv(BaseEnv):
 
             # Step the environment
             self.robosuite_env.step(action)
-            self._sim_step_count += 1
-
-            if hasattr(self, "viser_server") and self._sim_step_count % self._subsample_rate == 0:
-                self._update_viser_server()
-
-            if self._record_frames and self._sim_step_count % self._subsample_rate == 0:
-                self._record_frame()
-
+            self._post_step(action)
             steps += 1
 
     def _set_gripper(self, fraction: float) -> None:
@@ -368,13 +356,83 @@ class RobosuiteTwoArmLiftEnv(BaseEnv):
         action = np.concatenate([robot0_action, robot1_action])
 
         self.robosuite_env.step(action)
-        self._sim_step_count += 1
+        self._post_step(action)
 
-        if hasattr(self, "viser_server") and self._sim_step_count % self._subsample_rate == 0:
-            self._update_viser_server()
+    # ----------------------- Data collection -----------------------
 
-        if self._record_frames and self._sim_step_count % self._subsample_rate == 0:
-            self._record_frame()
+    def _emit_step_record(self, action: np.ndarray) -> None:
+        """Build a 16-D two-arm Step and fire the recorder callback."""
+        from capx.data.schema import Action, Observation, Step
+
+        try:
+            obs_dict = self.robosuite_env._get_observations()
+            r0_joints = np.asarray(obs_dict.get("robot0_joint_pos", np.zeros(7)), dtype=np.float32)
+            r1_joints = np.asarray(obs_dict.get("robot1_joint_pos", np.zeros(7)), dtype=np.float32)
+        except Exception:
+            r0_joints = np.zeros(7, dtype=np.float32)
+            r1_joints = np.zeros(7, dtype=np.float32)
+
+        try:
+            ee_pose = np.concatenate(
+                [
+                    self.robosuite_env.sim.data.xquat[self.gripper_link_idx_0],
+                    self.robosuite_env.sim.data.xpos[self.gripper_link_idx_0],
+                ]
+            ).astype(np.float32, copy=True)
+        except Exception:
+            ee_pose = np.zeros(7, dtype=np.float32)
+
+        action_arr = np.asarray(action, dtype=np.float32)
+        # Two-arm layout: action[0:7]=r0 joints, action[7]=r0 gripper, action[8:15]=r1 joints, action[15]=r1 gripper
+        r0_target = action_arr[:7].copy() if action_arr.size >= 7 else np.zeros(7, dtype=np.float32)
+        r1_target = action_arr[8:15].copy() if action_arr.size >= 15 else np.zeros(7, dtype=np.float32)
+
+        images = self._render_collect_images()
+        timestep = float(self._sim_step_count) / float(getattr(self, "_control_freq", 20) or 20)
+
+        step = Step(
+            timestep=timestep,
+            observation=Observation(
+                images=images if images else None,
+                joint_pos=r0_joints,
+                ee_pose=ee_pose,
+                gripper_fraction=float(self._gripper_fraction_0),
+            ),
+            action=Action(
+                joint_target=r0_target,
+                gripper_command=float(self._gripper_fraction_0),
+                native=action_arr.copy(),
+            ),
+            language_instruction=self._current_language_instruction,
+            reward=None,
+            info={
+                "robot1_joint_pos": r1_joints,
+                "robot1_joint_target": r1_target,
+                "robot1_gripper_fraction": float(self._gripper_fraction_1),
+            },
+        )
+        if self._step_recorder_cb is not None:
+            self._step_recorder_cb(step)
+
+    def get_dataset_metadata(self) -> dict[str, Any]:
+        control_freq = int(getattr(self, "_control_freq", 20))
+        sub = int(self._subsample_rate or 1)
+        return {
+            "robot": "franka_panda_dual",
+            "sim_backend": "robosuite",
+            "control_freq_hz": control_freq,
+            "subsample_rate": sub,
+            "sample_rate_hz": float(control_freq) / float(sub),
+            "action_space": {
+                "shape": [16],
+                "layout": "joint_targets_plus_gripper_per_arm",
+            },
+            "cameras": {"main": {"name": self.save_camera_name}},
+            "image_size": [self._render_height, self._render_width],
+        }
+
+    def get_language_instruction(self) -> str | None:
+        return self._task_prompt or self._current_language_instruction
 
     def _pot_pose_dict(self, robosuite_obs: dict[str, Any]) -> dict[str, list[float]]:
         """Get pot poses in robot base frame.

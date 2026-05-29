@@ -124,10 +124,16 @@ def _run_headless_trials(
     env_factory: dict[str, Any],
     config: dict[str, Any],
     start_time: float,
+    *,
+    collector_kwargs: dict[str, Any] | None = None,
 ) -> None:
     """Run all trials in headless CLI mode, then print a summary.
 
     Dispatches to parallel or sequential execution depending on ``num_workers``.
+    When ``collector_kwargs`` is provided, each worker instantiates a
+    :class:`RoboDMCollector` to persist successful trajectories. The eval entry
+    point (``launch.py``) never passes this kwarg, so collection is fully opt-in
+    via ``collect_data.py``.
     """
     if config["total_trials"] <= 0:
         print("No trials requested; exiting.")
@@ -145,16 +151,22 @@ def _run_headless_trials(
 
     # Execute trials
     if config["num_workers"] > 1:
-        setup_fn = functools.partial(_worker_setup, env_factory=env_factory)
+        setup_fn = functools.partial(
+            _worker_setup, env_factory=env_factory, collector_kwargs=collector_kwargs,
+        )
         trial_fn = functools.partial(_run_single_trial_worker, args=args, config=config)
         summaries = run_parallel_with_setup(
             trial_ids,
             num_workers=config["num_workers"],
             setup_fn=setup_fn,
             trial_fn=trial_fn,
+            teardown_fn=_worker_teardown,
         )
     else:
-        summaries = _run_trial_batch(trial_ids, args=args, env_factory=env_factory, config=config)
+        summaries = _run_trial_batch(
+            trial_ids, args=args, env_factory=env_factory, config=config,
+            collector_kwargs=collector_kwargs,
+        )
 
     summaries.sort(key=lambda s: s.trial)
     _print_and_save_summary(summaries, args, config, start_time)
@@ -169,26 +181,65 @@ def _run_headless_trials(
 # Worker setup and trial dispatch
 # ---------------------------------------------------------------------------
 
-def _worker_setup(*, env_factory: dict[str, Any]) -> tuple[Any, str | None]:
-    """Create the environment once per parallel worker.
+def _worker_setup(
+    *,
+    env_factory: dict[str, Any],
+    collector_kwargs: dict[str, Any] | None = None,
+) -> tuple[Any, str | None, Any]:
+    """Create the environment (and optionally a collector) once per worker.
 
     Returns:
-        Tuple of (environment, multi_turn_prompt).
+        Tuple of (environment, multi_turn_prompt, collector). Collector is
+        ``None`` unless ``collector_kwargs`` was supplied by the caller (only
+        ``collect_data.main`` ever does so).
     """
     env = instantiate(env_factory)
     multi_turn_prompt = env_factory["cfg"].get("multi_turn_prompt", None)
-    return (env, multi_turn_prompt)
+
+    collector = None
+    if collector_kwargs is not None:
+        # `record_hz` rides the same dict as a delivery channel but is for the
+        # env, not the collector — pop before forwarding.
+        collector_kwargs = dict(collector_kwargs)
+        record_hz = collector_kwargs.pop("record_hz", None)
+        if record_hz is not None:
+            # The runner's env is the CodeExecutionEnvBase wrapper; the
+            # subsample cadence lives on the underlying BaseEnv (same place
+            # attach_step_recorder is wired up in trial.py).
+            low_level = getattr(env, "low_level_env", env)
+            if hasattr(low_level, "configure_recording_rate"):
+                low_level.configure_recording_rate(record_hz)
+        from capx.data.robodm_collector import RoboDMCollector
+        collector = RoboDMCollector(worker_id=os.getpid(), **collector_kwargs)
+
+    return (env, multi_turn_prompt, collector)
+
+
+def _worker_teardown(state: tuple[Any, str | None, Any]) -> None:
+    """Flush and close the per-worker collector if one was created."""
+    try:
+        _, _, collector = state
+    except Exception:
+        return
+    if collector is not None:
+        try:
+            collector.close()
+        except Exception as e:
+            print(f"[robodm] collector.close() failed: {e}")
 
 
 def _run_single_trial_worker(
-    state: tuple[Any, str | None],
+    state: tuple[Any, str | None, Any],
     trial: int,
     *,
     args,
     config: dict[str, Any],
 ) -> TrialSummary:
     """Run a single trial using pre-initialized worker state (for parallel mode)."""
-    env, multi_turn_prompt = state
+    env, multi_turn_prompt, collector = state
+    if collector is not None:
+        # Per-trial shallow copy so other workers' configs aren't mutated.
+        config = {**config, "_collector": collector}
     return _run_trial_with_retries(env, trial, args, config, multi_turn_prompt)
 
 
@@ -238,6 +289,7 @@ def _run_trial_batch(
     args,
     env_factory: dict[str, Any],
     config: dict[str, Any],
+    collector_kwargs: dict[str, Any] | None = None,
 ) -> list[TrialSummary]:
     """Run a batch of trials sequentially (single-worker mode).
 
@@ -258,10 +310,32 @@ def _run_trial_batch(
 
     multi_turn_prompt = env_factory["cfg"].get("multi_turn_prompt", None)
 
+    collector = None
+    if collector_kwargs is not None:
+        collector_kwargs = dict(collector_kwargs)
+        record_hz = collector_kwargs.pop("record_hz", None)
+        if record_hz is not None:
+            # The runner's env is the CodeExecutionEnvBase wrapper; the
+            # subsample cadence lives on the underlying BaseEnv (same place
+            # attach_step_recorder is wired up in trial.py).
+            low_level = getattr(env, "low_level_env", env)
+            if hasattr(low_level, "configure_recording_rate"):
+                low_level.configure_recording_rate(record_hz)
+        from capx.data.robodm_collector import RoboDMCollector
+        collector = RoboDMCollector(worker_id=os.getpid(), **collector_kwargs)
+
     summaries: list[TrialSummary] = []
-    for trial in tqdm(trial_indices, desc="Running Trials"):
-        summary = _run_trial_with_retries(env, trial, args, config, multi_turn_prompt)
-        summaries.append(summary)
+    try:
+        for trial in tqdm(trial_indices, desc="Running Trials"):
+            cfg_for_trial = config if collector is None else {**config, "_collector": collector}
+            summary = _run_trial_with_retries(env, trial, args, cfg_for_trial, multi_turn_prompt)
+            summaries.append(summary)
+    finally:
+        if collector is not None:
+            try:
+                collector.close()
+            except Exception as e:
+                print(f"[robodm] collector.close() failed: {e}")
 
     summaries.sort(key=lambda s: s.trial)
     return summaries

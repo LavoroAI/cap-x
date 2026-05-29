@@ -1,0 +1,40 @@
+# VLA data-collection variant of franka_robosuite_nut_assembly.
+# Runs to a per-task QUOTA of successful `.vla` files.
+#
+# Usage:
+#   uv run capx/envs/collect_data.py --config-path env_configs/nut_assembly/franka_robosuite_nut_assembly_collect.yaml --use-oracle-code
+
+env:
+  _target_: capx.envs.tasks.franka.franka_nut_assembly.FrankaNutAssemblyCodeEnv
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level: franka_robosuite_nut_assembly_low_level
+    privileged: true
+    apis:
+      - FrankaControlNutAssemblyPrivilegedApi
+
+api_servers:
+  - _target_: capx.serving.launch_pyroki_server.main
+    port: 8116
+    host: 127.0.0.1
+    robot: panda_description
+    target_link: panda_hand
+
+output_dir: ./outputs/franka_robosuite_nut_assembly_collect
+record_video: false
+
+trials: 300
+num_workers: 12
+
+collect:
+  output_root: ./demos
+  task_id: franka_robosuite_nut_assembly
+  language_instruction: "Insert the square nut onto the small square peg."
+  target_successes: 100
+  max_trials: 300
+  keep_failures: false
+  video_codec: libx264
+  codec_options:
+    crf: 23
+    preset: veryfast
+  log_system_stats: false

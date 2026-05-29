@@ -31,7 +31,7 @@ os.environ.setdefault("MUJOCO_GL", "egl")
 class FrankaRobosuiteNutAssembly(RobosuiteBaseEnv):
     """Robosuite Franka NutAssembly environment with FrankaPickPlaceLowLevel-compatible interface."""
 
-    _SUBSAMPLE_RATE = 5
+    _SUBSAMPLE_RATE = 1
 
     def __init__(
         self,
@@ -188,7 +188,8 @@ class FrankaRobosuiteNutAssembly(RobosuiteBaseEnv):
 
         return obs, info
 
-    # Override _step_once to include the double _sim_step_count increment from original
+    # Override _step_once because nut_assembly uses single-channel gripper (action[:-1]) and
+    # does NOT render every step when viser is off (perf optimisation vs the base class).
     def _step_once(self) -> None:
         """Execute one simulation step with current control state."""
         action = self._build_action()
@@ -198,21 +199,13 @@ class FrankaRobosuiteNutAssembly(RobosuiteBaseEnv):
         else:
             self.robosuite_env.step(action[:-1], skip_render_images=True)
 
-        self._sim_step_count += 1
-
         self.gripper_link_wxyz_xyz = np.concatenate(
             [
                 self.robosuite_env.sim.data.xquat[self.gripper_link_idx],
                 self.robosuite_env.sim.data.xpos[self.gripper_link_idx],
             ]
         )
-        if self.viser_debug and self._sim_step_count % self._subsample_rate == 0:
-            self._update_viser_server()
-
-        if self._record_frames and self._sim_step_count % self._subsample_rate == 0:
-            self._record_frame()
-
-        self._sim_step_count += 1
+        self._post_step(action)
 
     # Override move_to_joints_blocking to use fast qpos path
     def move_to_joints_blocking(
@@ -242,16 +235,8 @@ class FrankaRobosuiteNutAssembly(RobosuiteBaseEnv):
             else:
                 self.robosuite_env.step(action[:-1], skip_render_images=True)
 
-            self._sim_step_count += 1
-
-            if self.viser_debug and self._sim_step_count % self._subsample_rate == 0:
-                self._update_viser_server()
-
-            if self._record_frames and self._sim_step_count % self._subsample_rate == 0:
-                self._record_frame()
-
+            self._post_step(action)
             steps += 1
-            self._sim_step_count += 1
 
     def _get_nut_pose(self, robosuite_obs: dict[str, Any]) -> dict[str, list[float]]:
         """Get nut pose in robot base frame."""

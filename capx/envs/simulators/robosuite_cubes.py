@@ -28,7 +28,7 @@ class FrankaRobosuiteCubesLowLevel(RobosuiteBaseEnv):
     Stack environment as the backend.
     """
 
-    _SUBSAMPLE_RATE = 5
+    _SUBSAMPLE_RATE = 1
 
     def __init__(
         self,

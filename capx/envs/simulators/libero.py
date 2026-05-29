@@ -83,7 +83,7 @@ class FrankaLiberoEnv(BaseEnv):
         self._wrist_frame_buffer: list[np.ndarray] = []
         self._record_wrist_camera = False
         self._wrist_camera_name = "robot0_eye_in_hand"
-        self._subsample_rate = 4
+        self._subsample_rate = 1
         self._full_viser_rate = 20  # Full scene update every 20 steps (cameras + pointcloud)
 
         # Robot link indices for transforms
@@ -244,7 +244,6 @@ class FrankaLiberoEnv(BaseEnv):
             self._current_obs, self._current_reward, self._current_done, self._current_info = (
                 self.handle.step(action)
             )
-            self._sim_step_count += 1
 
             self.gripper_link_wxyz_xyz = np.concatenate(
                 [
@@ -253,15 +252,7 @@ class FrankaLiberoEnv(BaseEnv):
                 ]
             )
 
-            if self.viser_debug and self._sim_step_count % self._subsample_rate == 0:
-                if self._sim_step_count % self._full_viser_rate == 0:
-                    self._update_viser_server()  # Full update with pointcloud
-                else:
-                    self._update_viser_robot_only()  # Fast robot-only
-
-            if self._record_frames and self._sim_step_count % self._subsample_rate == 0:
-                self._record_frame()
-
+            self._post_step(action)
             steps += 1
 
     def _set_gripper(self, fraction: float) -> None:
@@ -282,7 +273,6 @@ class FrankaLiberoEnv(BaseEnv):
         self._current_obs, self._current_reward, self._current_done, self._current_info = (
             self.handle.step(action)
         )
-        self._sim_step_count += 1
 
         self.gripper_link_wxyz_xyz = np.concatenate(
             [
@@ -291,11 +281,197 @@ class FrankaLiberoEnv(BaseEnv):
             ]
         )
 
-        if self.viser_debug and self._sim_step_count % self._subsample_rate == 0:
-            self._update_viser_robot_only()
+        self._post_step(action)
 
-        if self._record_frames and self._sim_step_count % self._subsample_rate == 0:
-            self._record_frame()
+    # ----------------------- Data collection -----------------------
+
+    def _post_step(self, action: np.ndarray) -> None:
+        """LIBERO-specific post-step: dual-rate viser updates (full vs robot-only).
+
+        Replaces the generic BaseEnv._post_step to preserve the original
+        full/robot-only viser dispatch on `_full_viser_rate` vs subsample cadence.
+        """
+        n = int(self._sim_step_count)
+        sub = int(self._subsample_rate or 1)
+        cadence = (n % sub == 0)
+
+        if cadence and self._record_frames:
+            try:
+                self._record_frame()
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception("_record_frame failed")
+
+        if (
+            self._step_recorder_cb is not None
+            and n % self._recorder_stride == 0
+        ):
+            try:
+                self._emit_step_record(action)
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception("_emit_step_record failed")
+
+        if self.viser_debug and cadence:
+            try:
+                if n % self._full_viser_rate == 0:
+                    self._update_viser_server()
+                else:
+                    self._update_viser_robot_only()
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception("viser update failed")
+
+        self._sim_step_count = n + 1
+
+    _COLLECT_CAMERAS: tuple[str, ...] = ("agentview", "robot0_eye_in_hand")
+
+    def _render_collect_images(self) -> dict[str, dict[str, np.ndarray]]:
+        """Render RGB (and optionally depth) and copy segmentation for each camera.
+
+        Depth is requested when ``_collect_save_depth`` is set; LIBERO doesn't
+        always have a depth buffer attached, so a per-camera failure is caught
+        so RGB is still saved. Segmentation is copied from
+        ``self._current_obs`` when the env exposes it.
+        """
+        save_depth = bool(getattr(self, "_collect_save_depth", False))
+        sim = self.handle.env.sim
+        current_obs = getattr(self, "_current_obs", None) or {}
+        seg_suffix = f"_segmentation_{self.segmentation_level}"
+
+        images: dict[str, dict[str, np.ndarray]] = {}
+        for cam in self._COLLECT_CAMERAS:
+            cam_imgs: dict[str, np.ndarray] = {}
+            try:
+                if save_depth:
+                    try:
+                        rgb_raw, depth_raw = sim.render(
+                            camera_name=cam,
+                            width=self._render_width,
+                            height=self._render_height,
+                            depth=True,
+                        )
+                        cam_imgs["rgb"] = np.ascontiguousarray(rgb_raw[::-1])
+                        cam_imgs["depth"] = get_real_depth_map(
+                            sim, depth_raw[::-1]
+                        ).astype(np.float32)
+                    except Exception:
+                        # Depth not supported for this camera; fall back to RGB only.
+                        rgb_raw = sim.render(
+                            camera_name=cam,
+                            width=self._render_width,
+                            height=self._render_height,
+                            depth=False,
+                        )
+                        cam_imgs["rgb"] = np.ascontiguousarray(rgb_raw[::-1])
+                else:
+                    rgb_raw = sim.render(
+                        camera_name=cam,
+                        width=self._render_width,
+                        height=self._render_height,
+                        depth=False,
+                    )
+                    cam_imgs["rgb"] = np.ascontiguousarray(rgb_raw[::-1])
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception(
+                    "sim.render failed for camera %s", cam
+                )
+                continue
+
+            seg_key = cam + seg_suffix
+            if seg_key in current_obs:
+                seg = np.asarray(current_obs[seg_key])
+                cam_imgs["segmentation"] = np.ascontiguousarray(
+                    seg[::-1].astype(np.int32, copy=False)
+                )
+
+            if cam_imgs:
+                images[cam] = cam_imgs
+        return images
+
+    def _emit_step_record(self, action: np.ndarray) -> None:
+        """Build a Step for LIBERO and fire the recorder callback.
+
+        Reads joints via the precomputed `_panda_joint_qpos_addrs` (fast path),
+        records both the normalised target (absolute joints) and the native
+        LIBERO action (joint deltas × control_freq + gripper).
+        """
+        from capx.data.schema import Action, Observation, Step
+
+        try:
+            joint_pos = np.asarray(
+                self.handle.env.sim.data.qpos[self._panda_joint_qpos_addrs], dtype=np.float32
+            )
+        except Exception:
+            joint_pos = np.zeros(7, dtype=np.float32)
+
+        try:
+            ee_pose = np.concatenate(
+                [
+                    self.handle.env.sim.data.xquat[self.gripper_link_idx],
+                    self.handle.env.sim.data.xpos[self.gripper_link_idx],
+                ]
+            ).astype(np.float32, copy=True)
+        except Exception:
+            ee_pose = np.zeros(7, dtype=np.float32)
+
+        joint_target = (
+            np.asarray(self._current_joints[:7], dtype=np.float32).copy()
+            if getattr(self, "_current_joints", None) is not None
+            else np.zeros(7, dtype=np.float32)
+        )
+
+        images = self._render_collect_images()
+
+        reward = float(self._current_reward) if self._current_reward is not None else None
+        timestep = float(self._sim_step_count) / float(self._control_freq or 20)
+
+        step = Step(
+            timestep=timestep,
+            observation=Observation(
+                images=images if images else None,
+                joint_pos=joint_pos,
+                ee_pose=ee_pose,
+                gripper_fraction=float(self._gripper_fraction),
+            ),
+            action=Action(
+                joint_target=joint_target,
+                gripper_command=float(self._gripper_fraction),
+                native=np.asarray(action, dtype=np.float32).copy(),
+            ),
+            language_instruction=self._current_language_instruction,
+            reward=reward,
+        )
+        if self._step_recorder_cb is not None:
+            self._step_recorder_cb(step)
+
+    def get_dataset_metadata(self) -> dict[str, Any]:
+        cameras: dict[str, Any] = {"main": {"name": "agentview"}}
+        if self._record_wrist_camera:
+            cameras["wrist"] = {"name": self._wrist_camera_name}
+        control_freq = int(self._control_freq)
+        sub = int(self._subsample_rate or 1)
+        return {
+            "robot": "franka_panda",
+            "sim_backend": "libero",
+            "suite": getattr(self.handle, "suite_name", None),
+            "task_id": getattr(self.handle, "task_id", None),
+            "task_language": getattr(self.handle, "task_language", None),
+            "control_freq_hz": control_freq,
+            "subsample_rate": sub,
+            "sample_rate_hz": float(control_freq) / float(sub),
+            "action_space": {
+                "native": {"shape": [8], "layout": "joint_deltas_scaled_plus_gripper"},
+                "normalised": {"shape": [8], "layout": "joint_targets_plus_gripper_frac"},
+            },
+            "cameras": cameras,
+            "image_size": [self._render_height, self._render_width],
+            "max_steps": self.max_steps,
+        }
+
+    def get_language_instruction(self) -> str | None:
+        return getattr(self.handle, "task_language", None) or self._current_language_instruction
 
     def _get_object_pose(self, obj_name: str) -> tuple[np.ndarray, np.ndarray]:
         """Get the pose of an object in the environment as a position (3,) and WXYZ quaternion (4,).

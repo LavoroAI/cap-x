@@ -22,7 +22,7 @@ from capx.envs.simulators.robosuite_base import RobosuiteBaseEnv
 class FrankaRobosuiteSpillWipeLowLevel(RobosuiteBaseEnv):
     """Robosuite Franka Wipe environment with FrankaPickPlaceLowLevel-compatible interface."""
 
-    _SUBSAMPLE_RATE = 10
+    _SUBSAMPLE_RATE = 1
     _ACTION_SLICE = -2  # Wipe env uses action[:-2] instead of action[:-1]
 
     def __init__(

@@ -35,7 +35,7 @@ class RobosuiteBaseEnv(BaseEnv):
     """
 
     # Subclasses can override these defaults
-    _SUBSAMPLE_RATE: int = 5
+    _SUBSAMPLE_RATE: int = 1
     _ACTION_SLICE: int = -1  # action[:-1] for most envs, action[:-2] for spill_wipe
 
     def __init__(
@@ -94,6 +94,9 @@ class RobosuiteBaseEnv(BaseEnv):
             ]
         )
 
+        # Capture control frequency for the data-collection schema (Hz).
+        self._control_freq = int(getattr(self.robosuite_env, "control_freq", 20))
+
     def _init_viser_debug(self, viser_debug: bool) -> None:
         """Initialize viser debug state. Call at end of subclass __init__."""
         if viser_debug:
@@ -148,12 +151,7 @@ class RobosuiteBaseEnv(BaseEnv):
                 self.robosuite_env.sim.data.xpos[self.gripper_link_idx],
             ]
         )
-        if hasattr(self, "viser_server") and self._sim_step_count % self._subsample_rate == 0:
-            self._update_viser_server()
-
-        if self._record_frames and self._sim_step_count % self._subsample_rate == 0:
-            self._record_frame()
-        self._sim_step_count += 1
+        self._post_step(action)
 
     def move_to_joints_non_blocking(self, joints: np.ndarray) -> None:
         """Move to target joint positions using Robosuite's controller (non-blocking)."""
@@ -162,14 +160,7 @@ class RobosuiteBaseEnv(BaseEnv):
         action[-2:] = 1.0 - action[-2:] * 2.0
 
         self._do_robosuite_step(action)
-
-        if hasattr(self, "viser_server") and self._sim_step_count % self._subsample_rate == 0:
-            self._update_viser_server()
-
-        if self._record_frames and self._sim_step_count % self._subsample_rate == 0:
-            self._record_frame()
-
-        self._sim_step_count += 1
+        self._post_step(action)
 
     def move_to_joints_blocking(
         self, joints: np.ndarray, *, tolerance: float = 0.02, max_steps: int = 100
@@ -197,15 +188,9 @@ class RobosuiteBaseEnv(BaseEnv):
             action[-2:] = 1.0 - action[-2:] * 2.0
 
             self._do_robosuite_step(action)
-
-            if hasattr(self, "viser_server") and self._sim_step_count % self._subsample_rate == 0:
-                self._update_viser_server()
-
-            if self._record_frames and self._sim_step_count % self._subsample_rate == 0:
-                self._record_frame()
+            self._post_step(action)
 
             steps += 1
-            self._sim_step_count += 1
 
     def step(self, action: Any) -> tuple[dict[str, Any], float, bool, bool, dict[str, Any]]:
         """Low-level step - not typically called directly in code execution mode."""
@@ -371,6 +356,124 @@ class RobosuiteBaseEnv(BaseEnv):
                 depth=False,
             )
             self._wrist_frame_buffer.append(wrist_frame[::-1])
+
+    # ------------------------- Data collection -------------------------
+
+    def _render_collect_images(self) -> dict[str, dict[str, np.ndarray]]:
+        """Render RGB (and depth, if ``_collect_save_depth``) for every camera.
+
+        Iterates ``self.render_camera_names`` plus the wrist camera (when
+        ``_record_wrist_camera`` is set). Each camera is rendered directly via
+        ``sim.render`` so data collection is independent of the eval-side video
+        capture buffer.
+        """
+        save_depth = bool(getattr(self, "_collect_save_depth", False))
+        cams = list(self.render_camera_names)
+        if self._record_wrist_camera and self._wrist_camera_name not in cams:
+            cams.append(self._wrist_camera_name)
+
+        sim = self.robosuite_env.sim
+        images: dict[str, dict[str, np.ndarray]] = {}
+        for cam in cams:
+            try:
+                rendered = sim.render(
+                    camera_name=cam,
+                    width=self._render_width,
+                    height=self._render_height,
+                    depth=save_depth,
+                )
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception(
+                    "sim.render failed for camera %s", cam
+                )
+                continue
+
+            if save_depth:
+                rgb_raw, depth_raw = rendered
+                depth_metric = get_real_depth_map(sim, depth_raw[::-1]).astype(np.float32)
+                images[cam] = {
+                    "rgb": np.ascontiguousarray(rgb_raw[::-1]),
+                    "depth": depth_metric,
+                }
+            else:
+                images[cam] = {"rgb": np.ascontiguousarray(rendered[::-1])}
+        return images
+
+    def _emit_step_record(self, action: np.ndarray) -> None:
+        """Build a Step from the env's current state and fire the recorder callback.
+
+        Reads joint positions fresh from the robosuite observation and the
+        end-effector pose fresh from sim.data — never from the stale
+        ``_current_joints`` / cached ``gripper_link_wxyz_xyz`` attributes — so
+        the recorded data is exact for the step that just executed.
+        """
+        from capx.data.schema import Action, Observation, Step
+
+        # Fresh joint positions.
+        try:
+            obs_dict = self.robosuite_env._get_observations()
+            joint_pos = np.asarray(obs_dict.get("robot0_joint_pos", np.zeros(7)), dtype=np.float32)
+        except Exception:
+            joint_pos = np.zeros(7, dtype=np.float32)
+
+        # Fresh ee pose (quat wxyz + pos xyz).
+        try:
+            ee_pose = np.concatenate(
+                [
+                    self.robosuite_env.sim.data.xquat[self.gripper_link_idx],
+                    self.robosuite_env.sim.data.xpos[self.gripper_link_idx],
+                ]
+            ).astype(np.float32, copy=True)
+        except Exception:
+            ee_pose = np.zeros(7, dtype=np.float32)
+
+        images = self._render_collect_images()
+
+        action_arr = np.asarray(action, dtype=np.float32)
+        joint_target = (
+            action_arr[:7].copy() if action_arr.size >= 7 else np.zeros(7, dtype=np.float32)
+        )
+
+        timestep = float(self._sim_step_count) / float(getattr(self, "_control_freq", 20) or 20)
+        step = Step(
+            timestep=timestep,
+            observation=Observation(
+                images=images if images else None,
+                joint_pos=joint_pos,
+                ee_pose=ee_pose,
+                gripper_fraction=float(self._gripper_fraction),
+            ),
+            action=Action(
+                joint_target=joint_target,
+                gripper_command=float(self._gripper_fraction),
+                native=action_arr.copy(),
+            ),
+            language_instruction=self._current_language_instruction,
+            reward=None,
+        )
+        if self._step_recorder_cb is not None:
+            self._step_recorder_cb(step)
+
+    def get_dataset_metadata(self) -> dict[str, Any]:
+        cameras: dict[str, Any] = {"main": {"name": self.save_camera_name}}
+        if self._record_wrist_camera:
+            cameras["wrist"] = {"name": self._wrist_camera_name}
+        control_freq = int(getattr(self, "_control_freq", 20))
+        sub = int(self._subsample_rate or 1)
+        return {
+            "robot": "franka_panda",
+            "sim_backend": "robosuite",
+            "control_freq_hz": control_freq,
+            "subsample_rate": sub,
+            "sample_rate_hz": float(control_freq) / float(sub),
+            "action_space": {
+                "shape": [8],
+                "layout": "joint_targets_plus_gripper_frac_x2",
+            },
+            "cameras": cameras,
+            "image_size": [self._render_height, self._render_width],
+        }
 
     def render(self, mode: str = "rgb_array") -> np.ndarray:  # type: ignore[override]
         if mode != "rgb_array":

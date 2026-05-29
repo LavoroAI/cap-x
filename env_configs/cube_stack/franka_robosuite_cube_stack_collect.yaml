@@ -1,0 +1,45 @@
+# VLA data-collection variant of franka_robosuite_cube_stack.
+# Runs to a per-task QUOTA of successful `.vla` files, not a fixed trial count.
+#
+# Usage:
+#   uv run capx/envs/collect_data.py --config-path env_configs/cube_stack/franka_robosuite_cube_stack_collect.yaml --use-oracle-code
+
+env:
+  _target_: capx.envs.tasks.franka.franka_pick_place.FrankaPickPlaceCodeEnv
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level: franka_robosuite_cubes_low_level
+    privileged: true
+    apis:
+      - FrankaControlPrivilegedApi
+
+api_servers:
+  - _target_: capx.serving.launch_pyroki_server.main
+    port: 8116
+    host: 127.0.0.1
+    robot: panda_description
+    target_link: panda_hand
+
+# Eval debug artifacts (code, logs) still go to outputs/.
+output_dir: ./outputs/franka_robosuite_cube_stack_collect
+
+# Debug MP4s not needed during collection; the .vla file already has the RGB stream.
+record_video: false
+
+# Safety upper bound; collect: stops earlier when target_successes is reached.
+trials: 300
+num_workers: 12
+
+collect:
+  output_root: ./demos
+  task_id: franka_robosuite_cube_stack
+  language_instruction: "Stack the red cube on top of the green cube."
+  target_successes: 10
+  max_trials: 300
+  keep_failures: false
+  # record_hz: 20.0   # optional; default = control_freq (record every sim step)
+  video_codec: libx264
+  codec_options:
+    crf: 23
+    preset: veryfast
+  log_system_stats: false

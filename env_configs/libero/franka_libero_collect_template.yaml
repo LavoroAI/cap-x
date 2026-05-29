@@ -1,0 +1,59 @@
+# VLA data-collection TEMPLATE for LIBERO tasks.
+#
+# This file is a base template. For multi-task LIBERO collection, the curriculum
+# builder in `capx.data.curriculum.build_libero_curriculum` enumerates tasks via
+# `libero.benchmark.get_benchmark_dict()` and constructs per-task LaunchArgs at
+# runtime — there is no per-task YAML for LIBERO (the task_id + language come
+# from the LIBERO benchmark itself, set on the env at start_episode).
+#
+# To run a single LIBERO task: edit suite_name / task_id below.
+#
+# Usage:
+#   uv run capx/envs/collect_data.py --config-path env_configs/libero/franka_libero_collect_template.yaml --use-oracle-code
+#
+# Multi-task sweep (all tasks in declared suite(s) — set `collect.libero_suites:` or pass --multi-task libero):
+#   uv run capx/envs/collect_data.py --config-path env_configs/libero/franka_libero_collect_template.yaml --multi-task libero --use-oracle-code
+
+env:
+  _target_: capx.envs.tasks.franka.franka_libero_env.FrankaLiberoCodeEnv
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level:
+      _target_: capx.envs.simulators.libero.FrankaLiberoEnv
+      suite_name: libero_object       # override per task
+      task_id: 0                       # override per task
+      privileged: true
+      max_steps: 4000
+      control_freq: 20
+    privileged: true
+    apis:
+      - FrankaLiberoApiPrivileged
+
+api_servers:
+  - _target_: capx.serving.launch_pyroki_server.main
+    port: 8116
+    host: 127.0.0.1
+    robot: panda_description
+    target_link: panda_hand
+
+output_dir: ./outputs/franka_libero_collect
+record_video: false
+
+trials: 50
+num_workers: 8
+
+collect:
+  output_root: ./demos
+  # task_id and language_instruction are filled in by build_libero_curriculum
+  # (or by editing this template for a single-task collection run).
+  task_id: franka_libero_object_0
+  language_instruction: ""             # falls back to handle.task_language
+  target_successes: 30
+  max_trials: 100
+  keep_failures: false
+  # record_hz: 20.0   # optional; default = control_freq (record every sim step)
+  video_codec: libx264
+  codec_options:
+    crf: 23
+    preset: veryfast
+  log_system_stats: false

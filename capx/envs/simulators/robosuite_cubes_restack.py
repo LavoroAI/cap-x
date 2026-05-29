@@ -243,7 +243,7 @@ class StackedObjectRandomSampler(ObjectPositionSampler):
 class FrankaRobosuiteCubesRestackLowLevel(RobosuiteBaseEnv):
     """Robosuite Franka Stack environment with FrankaPickPlaceLowLevel-compatible interface."""
 
-    _SUBSAMPLE_RATE = 5
+    _SUBSAMPLE_RATE = 1
 
     def __init__(
         self,

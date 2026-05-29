@@ -107,6 +107,7 @@ def _worker_loop_with_setup(
     result_queue: multiprocessing.Queue,
     setup_fn: Callable[[], Any],
     trial_fn: Callable[[Any, int], BatchResult],
+    teardown_fn: Callable[[Any], None] | None = None,
 ) -> None:
     """Worker loop that initializes state once, then pulls trials from queue.
 
@@ -119,6 +120,8 @@ def _worker_loop_with_setup(
         result_queue: Queue to put results into.
         setup_fn: Function called once to create worker state (e.g., environment).
         trial_fn: Function that takes (state, trial_id) and returns a result.
+        teardown_fn: Optional callback receiving the state when the worker exits.
+            Used to release resources (e.g., flush a per-worker data collector).
     """
     # Initialize worker state once
     try:
@@ -128,26 +131,34 @@ def _worker_loop_with_setup(
         result_queue.put(("setup_error", worker_id, str(e)))
         return
 
-    while True:
-        try:
-            # Non-blocking get with timeout to allow clean shutdown
-            trial_id = task_queue.get(timeout=1.0)
-        except Exception:
-            # Queue is empty or closed
-            break
+    try:
+        while True:
+            try:
+                # Non-blocking get with timeout to allow clean shutdown
+                trial_id = task_queue.get(timeout=1.0)
+            except Exception:
+                # Queue is empty or closed
+                break
 
-        if trial_id is None:
-            # Sentinel value signals worker to exit
-            break
+            if trial_id is None:
+                # Sentinel value signals worker to exit
+                break
 
-        try:
-            result = trial_fn(state, trial_id)
-            result_queue.put(("success", trial_id, result))
-        except Exception as e:
-            import traceback
+            try:
+                result = trial_fn(state, trial_id)
+                result_queue.put(("success", trial_id, result))
+            except Exception as e:
+                import traceback
 
-            error_msg = f"{str(e)}\n{traceback.format_exc()}"
-            result_queue.put(("error", trial_id, error_msg))
+                error_msg = f"{str(e)}\n{traceback.format_exc()}"
+                result_queue.put(("error", trial_id, error_msg))
+    finally:
+        if teardown_fn is not None:
+            try:
+                teardown_fn(state)
+            except Exception as e:
+                import traceback
+                print(f"Worker {worker_id} teardown failed: {e}\n{traceback.format_exc()}")
 
 
 def run_parallel_dynamic(
@@ -230,6 +241,7 @@ def run_parallel_with_setup(
     num_workers: int,
     setup_fn: Callable[[], Any],
     trial_fn: Callable[[Any, int], BatchResult],
+    teardown_fn: Callable[[Any], None] | None = None,
     mp_start_method: str = "spawn",
 ) -> list[BatchResult]:
     """Execute trials dynamically with per-worker setup (e.g., environment creation).
@@ -247,6 +259,9 @@ def run_parallel_with_setup(
             Must be picklable.
         trial_fn: Callable that takes (state, trial_id) and returns a result.
             Must be picklable.
+        teardown_fn: Optional callable invoked with the worker state when the
+            worker exits (clean shutdown or after queue drain). Used to flush
+            per-worker resources (e.g., a data collector). Must be picklable.
         mp_start_method: Multiprocessing start method (defaults to ``"spawn"`` for
             compatibility with CUDA + Mujoco setups).
 
@@ -258,7 +273,14 @@ def run_parallel_with_setup(
 
     if num_workers <= 1:
         state = setup_fn()
-        return [trial_fn(state, tid) for tid in trial_ids]
+        try:
+            return [trial_fn(state, tid) for tid in trial_ids]
+        finally:
+            if teardown_fn is not None:
+                try:
+                    teardown_fn(state)
+                except Exception as e:
+                    print(f"teardown_fn failed: {e}")
 
     ctx = multiprocessing.get_context(mp_start_method)
     task_queue: multiprocessing.Queue = ctx.Queue()
@@ -277,7 +299,7 @@ def run_parallel_with_setup(
     for worker_id in range(num_workers):
         p = ctx.Process(
             target=_worker_loop_with_setup,
-            args=(worker_id, task_queue, result_queue, setup_fn, trial_fn),
+            args=(worker_id, task_queue, result_queue, setup_fn, trial_fn, teardown_fn),
         )
         p.start()
         workers.append(p)

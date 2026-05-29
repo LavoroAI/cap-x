@@ -685,278 +685,331 @@ def _run_single_trial(
     # Wrist camera base64 history for image-based multiview differencing
     wrist_base64_history: list[str] | None = [] if use_wrist else None
 
-    visual_differencing_args = ModelQueryArgs(
-        model=args.visual_differencing_model,
-        server_url=args.visual_differencing_model_server_url,
-        api_key=args.visual_differencing_model_api_key,
-        max_tokens=args.max_tokens,
-        temperature=args.temperature,
-        reasoning_effort=args.reasoning_effort,
-        debug=args.debug,
-    )
+    # --- Data collection lifecycle (start_episode) ---
+    collector = config.get("_collector")
+    episode_handle = None
+    if collector is not None and hasattr(env, "low_level_env"):
+        _ll = env.low_level_env
+        _lang = (
+            config.get("language_instruction")
+            or (_ll.get_language_instruction() if hasattr(_ll, "get_language_instruction") else None)
+            or ""
+        )
+        _ll._current_language_instruction = _lang
+        _ll._collect_save_depth = bool(config.get("collect_save_depth", False))
+        try:
+            episode_handle = collector.start_episode(
+                task_id=config.get("task_id") or "unknown_task",
+                language_instruction=_lang,
+                seed=trial,
+                env_metadata=(_ll.get_dataset_metadata() if hasattr(_ll, "get_dataset_metadata") else {}),
+            )
+            _ll.attach_step_recorder(
+                lambda step: collector.append_step(episode_handle, step)
+            )
+        except Exception as _e:
+            print(f"[robodm] start_episode failed: {_e}")
+            episode_handle = None
 
-    if config["use_img_differencing"] or use_video_diff:
-        assert visual_differencing_args.model in VLM_MODELS, (
-            "Image/video differencing model must be in the list of VLM models"
+    try:
+        visual_differencing_args = ModelQueryArgs(
+            model=args.visual_differencing_model,
+            server_url=args.visual_differencing_model_server_url,
+            api_key=args.visual_differencing_model_api_key,
+            max_tokens=args.max_tokens,
+            temperature=args.temperature,
+            reasoning_effort=args.reasoning_effort,
+            debug=args.debug,
         )
 
-    # --- 2. Capture initial visual feedback ---
-    visual_feedback_imgs, visual_feedback_base64_history, task_description = (
-        _capture_initial_visual_feedback(env, obs, config, args, visual_differencing_args)
-    )
-
-    # Seed wrist base64 history with initial wrist image
-    if use_wrist and wrist_base64_history is not None and hasattr(env, "render_wrist"):
-        wrist_img = env.render_wrist()
-        if wrist_img is not None:
-            pil_wrist = Image.fromarray(wrist_img)
-            buf = io.BytesIO()
-            pil_wrist.save(buf, format="png")
-            wrist_base64_history.append(
-                f"data:image/png;base64,"
-                f"{base64.b64encode(buf.getvalue()).decode('utf-8')}"
+        if config["use_img_differencing"] or use_video_diff:
+            assert visual_differencing_args.model in VLM_MODELS, (
+                "Image/video differencing model must be in the list of VLM models"
             )
 
-    # --- 3. Initial code generation ---
-    if config["use_oracle_code"]:
-        raw_code = env.oracle_code
-        with open(os.path.join(config["output_dir"], "oracle_code.py"), "w") as f:
-            f.write(raw_code)
-        reasoning = None
-        ensemble_data = None
-    else:
-        raw_code, reasoning, ensemble_data = _query_initial_code(args, config, obs)
+        # --- 2. Capture initial visual feedback ---
+        visual_feedback_imgs, visual_feedback_base64_history, task_description = (
+            _capture_initial_visual_feedback(env, obs, config, args, visual_differencing_args)
+        )
 
-    # Initialize partial artifacts for timeout recovery
-    if partial_artifacts is not None:
-        partial_artifacts.update({
-            "raw_code": raw_code,
-            "code_blocks": code_blocks,
-            "code_block_metadata": code_block_metadata,
-            "all_responses": all_responses,
-            "visual_feedback_imgs": visual_feedback_imgs,
-            "info_step": info_step,
-            "reward": reward,
-            "terminated": terminated,
-            "truncated": truncated,
-            "num_regenerations": num_regenerations,
-            "num_finishes": num_finishes,
-            "num_code_blocks": 0,
-            "ensemble_data": ensemble_data,
-            "multiturn_ensemble_data": multiturn_ensemble_data,
-        })
+        # Seed wrist base64 history with initial wrist image
+        if use_wrist and wrist_base64_history is not None and hasattr(env, "render_wrist"):
+            wrist_img = env.render_wrist()
+            if wrist_img is not None:
+                pil_wrist = Image.fromarray(wrist_img)
+                buf = io.BytesIO()
+                pil_wrist.save(buf, format="png")
+                wrist_base64_history.append(
+                    f"data:image/png;base64,"
+                    f"{base64.b64encode(buf.getvalue()).decode('utf-8')}"
+                )
 
-    # Parse initial code into blocks
-    initial_blocks = _extract_code(raw_code)
-    code_blocks.extend(initial_blocks)
-    code_block_metadata.extend([{"generation": 0, "regenerated": False}] * len(initial_blocks))
-    all_responses.append({
-        "block_idx": [0],
-        "code_blocks": initial_blocks,
-        "decision": "initial",
-        "initial_prompt": copy.deepcopy(obs["full_prompt"]),
-        "reasoning": reasoning if reasoning is not None else "",
-    })
+        # --- 3. Initial code generation ---
+        if config["use_oracle_code"]:
+            raw_code = env.oracle_code
+            with open(os.path.join(config["output_dir"], "oracle_code.py"), "w") as f:
+                f.write(raw_code)
+            reasoning = None
+            ensemble_data = None
+        else:
+            raw_code, reasoning, ensemble_data = _query_initial_code(args, config, obs)
 
-    with open(os.path.join(config["output_dir"], "all_responses.json"), "w") as f:
-        json.dump(all_responses, f)
-
-    if args.debug:
-        with open(os.path.join(config["output_dir"], "code_init.txt"), "w") as f:
-            f.write("\n".join(initial_blocks))
-
-    # --- 4. Execute code blocks (with optional multi-turn) ---
-    info_step = {"sandbox_rc": -1, "stdout": "", "stderr": ""}
-    reward = 0.0
-    terminated = truncated = False
-    code_block_idx = 0
-
-    # Track whether we're recording frames (for video diff or record_video)
-    recording_frames = (
-        (config["record_video"] or use_video_diff)
-        and hasattr(env, "get_video_frame_count")
-    )
-
-    while code_block_idx < len(code_blocks) and code_block_idx <= MULTITURN_LIMIT:
-        code = code_blocks[code_block_idx]
-        code_block_idx += 1
-
-        # Record frame index before step
-        frame_start = env.get_video_frame_count() if recording_frames else 0
-
-        obs_next, reward, terminated, truncated, info_step = env.step(code)
-
-        # Record frame index after step
-        frame_end = env.get_video_frame_count() if recording_frames else 0
-        turn_frame_ranges.append((frame_start, frame_end))
-
+        # Initialize partial artifacts for timeout recovery
         if partial_artifacts is not None:
             partial_artifacts.update({
+                "raw_code": raw_code,
+                "code_blocks": code_blocks,
+                "code_block_metadata": code_block_metadata,
+                "all_responses": all_responses,
+                "visual_feedback_imgs": visual_feedback_imgs,
                 "info_step": info_step,
                 "reward": reward,
                 "terminated": terminated,
                 "truncated": truncated,
+                "num_regenerations": num_regenerations,
+                "num_finishes": num_finishes,
+                "num_code_blocks": 0,
+                "ensemble_data": ensemble_data,
+                "multiturn_ensemble_data": multiturn_ensemble_data,
             })
 
-        obs = obs_next
+        # Parse initial code into blocks
+        initial_blocks = _extract_code(raw_code)
+        code_blocks.extend(initial_blocks)
+        code_block_metadata.extend([{"generation": 0, "regenerated": False}] * len(initial_blocks))
+        all_responses.append({
+            "block_idx": [0],
+            "code_blocks": initial_blocks,
+            "decision": "initial",
+            "initial_prompt": copy.deepcopy(obs["full_prompt"]),
+            "reasoning": reasoning if reasoning is not None else "",
+        })
 
-        # Multi-turn decision
-        if multi_turn_prompt:
-            if "terminated episode" in info_step["stderr"]:
-                truncated = True
-                break
+        with open(os.path.join(config["output_dir"], "all_responses.json"), "w") as f:
+            json.dump(all_responses, f)
 
-            # Get turn frames for video differencing
-            turn_frames = None
-            wrist_turn_frames = None
-            if use_video_diff and recording_frames:
-                turn_frames = env.get_video_frames_range(frame_start, frame_end)
-                if use_wrist and hasattr(env, "get_wrist_video_frames_range"):
-                    wrist_turn_frames = env.get_wrist_video_frames_range(
-                        frame_start, frame_end,
+        if args.debug:
+            with open(os.path.join(config["output_dir"], "code_init.txt"), "w") as f:
+                f.write("\n".join(initial_blocks))
+
+        # --- 4. Execute code blocks (with optional multi-turn) ---
+        info_step = {"sandbox_rc": -1, "stdout": "", "stderr": ""}
+        reward = 0.0
+        terminated = truncated = False
+        code_block_idx = 0
+
+        # Track whether we're recording frames (for video diff or record_video)
+        recording_frames = (
+            (config["record_video"] or use_video_diff)
+            and hasattr(env, "get_video_frame_count")
+        )
+
+        while code_block_idx < len(code_blocks) and code_block_idx <= MULTITURN_LIMIT:
+            code = code_blocks[code_block_idx]
+            code_block_idx += 1
+
+            # Record frame index before step
+            frame_start = env.get_video_frame_count() if recording_frames else 0
+
+            obs_next, reward, terminated, truncated, info_step = env.step(code)
+
+            # Record frame index after step
+            frame_end = env.get_video_frame_count() if recording_frames else 0
+            turn_frame_ranges.append((frame_start, frame_end))
+
+            if partial_artifacts is not None:
+                partial_artifacts.update({
+                    "info_step": info_step,
+                    "reward": reward,
+                    "terminated": terminated,
+                    "truncated": truncated,
+                })
+
+            obs = obs_next
+
+            # Multi-turn decision
+            if multi_turn_prompt:
+                if "terminated episode" in info_step["stderr"]:
+                    truncated = True
+                    break
+
+                # Get turn frames for video differencing
+                turn_frames = None
+                wrist_turn_frames = None
+                if use_video_diff and recording_frames:
+                    turn_frames = env.get_video_frames_range(frame_start, frame_end)
+                    if use_wrist and hasattr(env, "get_wrist_video_frames_range"):
+                        wrist_turn_frames = env.get_wrist_video_frames_range(
+                            frame_start, frame_end,
+                        )
+
+                decision, new_code, mt_reasoning, mt_ensemble, decision_prompt = _handle_multi_turn_step(
+                    env, obs, args, config, visual_differencing_args,
+                    multi_turn_prompt, code_blocks, code_block_idx, info_step,
+                    task_description, visual_feedback_imgs, visual_feedback_base64_history,
+                    stderr_history,
+                    turn_frames=turn_frames,
+                    wrist_turn_frames=wrist_turn_frames,
+                    wrist_base64_history=wrist_base64_history,
+                )
+
+                if mt_ensemble is not None:
+                    mt_ensemble["regeneration"] = num_regenerations + 1
+                    multiturn_ensemble_data.append(mt_ensemble)
+
+                if decision == "regenerate":
+                    print("Model chose to regenerate code")
+                    new_blocks = _extract_code(new_code)
+                    all_responses.append({
+                        "multi_turn_prompt": decision_prompt if config.get("save_multiturn_prompts", False) else None,
+                        "block_idx": [code_block_idx],
+                        "code_blocks": new_blocks,
+                        "decision": "regenerate",
+                        "reasoning": mt_reasoning if mt_reasoning is not None else "",
+                    })
+                    del code_blocks[code_block_idx:]
+                    del code_block_metadata[code_block_idx:]
+                    code_blocks.extend(new_blocks)
+                    code_block_metadata.extend(
+                        [{"generation": num_regenerations + 1, "regenerated": True,
+                          "regenerated_at_idx": code_block_idx}]
+                        * len(new_blocks)
                     )
+                    num_regenerations += 1
+                    if partial_artifacts is not None:
+                        partial_artifacts["num_regenerations"] = num_regenerations
 
-            decision, new_code, mt_reasoning, mt_ensemble, decision_prompt = _handle_multi_turn_step(
-                env, obs, args, config, visual_differencing_args,
-                multi_turn_prompt, code_blocks, code_block_idx, info_step,
-                task_description, visual_feedback_imgs, visual_feedback_base64_history,
-                stderr_history,
-                turn_frames=turn_frames,
-                wrist_turn_frames=wrist_turn_frames,
-                wrist_base64_history=wrist_base64_history,
+                elif decision == "finish":
+                    all_responses.append({
+                        "decision": "finish",
+                        "reasoning": mt_reasoning if mt_reasoning is not None else (new_code or ""),
+                    })
+                    print("Model chose to finish")
+                    num_finishes += 1
+                    if partial_artifacts is not None:
+                        partial_artifacts["num_finishes"] = num_finishes
+                    break
+
+            print(f"Code block {code_block_idx} done")
+            print(f"Number of code blocks: {len(code_blocks)}")
+
+            # Save intermediate artifacts (code, logs) per code block
+            final_code = _annotate_code_blocks(code_blocks, code_block_metadata)
+            _save_trial_artifacts(
+                config, trial, info_step["sandbox_rc"], reward,
+                info_step.get("task_completed", False), final_code, raw_code,
+                all_responses, ["-" * 100, "Generated program:", final_code],
+                visual_feedback_imgs,
             )
 
-            if mt_ensemble is not None:
-                mt_ensemble["regeneration"] = num_regenerations + 1
-                multiturn_ensemble_data.append(mt_ensemble)
-
-            if decision == "regenerate":
-                print("Model chose to regenerate code")
-                new_blocks = _extract_code(new_code)
-                all_responses.append({
-                    "multi_turn_prompt": decision_prompt if config.get("save_multiturn_prompts", False) else None,
-                    "block_idx": [code_block_idx],
-                    "code_blocks": new_blocks,
-                    "decision": "regenerate",
-                    "reasoning": mt_reasoning if mt_reasoning is not None else "",
-                })
-                del code_blocks[code_block_idx:]
-                del code_block_metadata[code_block_idx:]
-                code_blocks.extend(new_blocks)
-                code_block_metadata.extend(
-                    [{"generation": num_regenerations + 1, "regenerated": True,
-                      "regenerated_at_idx": code_block_idx}]
-                    * len(new_blocks)
+            # Only save intermediate video if NOT doing per-turn saving
+            # (per-turn saving is deferred to after the loop to avoid clearing the buffer)
+            if not recording_frames:
+                _save_trial_video(
+                    env, config, trial, info_step, reward, len(code_blocks),
+                    suffix_extra=str(len(code_blocks)),
                 )
-                num_regenerations += 1
-                if partial_artifacts is not None:
-                    partial_artifacts["num_regenerations"] = num_regenerations
 
-            elif decision == "finish":
-                all_responses.append({
-                    "decision": "finish",
-                    "reasoning": mt_reasoning if mt_reasoning is not None else (new_code or ""),
-                })
-                print("Model chose to finish")
-                num_finishes += 1
-                if partial_artifacts is not None:
-                    partial_artifacts["num_finishes"] = num_finishes
-                break
+        print("Code blocks done")
 
-        print(f"Code block {code_block_idx} done")
-        print(f"Number of code blocks: {len(code_blocks)}")
-
-        # Save intermediate artifacts (code, logs) per code block
+        # --- 5. Build final summary ---
         final_code = _annotate_code_blocks(code_blocks, code_block_metadata)
-        _save_trial_artifacts(
+        num_code_blocks = len(code_blocks)
+
+        if partial_artifacts is not None:
+            partial_artifacts["final_code"] = final_code
+            partial_artifacts["num_code_blocks"] = num_code_blocks
+
+        # Override sandbox_rc for terminated-episode stderr
+        if "executing action in terminated episode" in info_step["stderr"]:
+            sandbox_rc_override = 0
+        if sandbox_rc_override is not None:
+            info_step["sandbox_rc"] = sandbox_rc_override
+
+        stderr = "\n\n".join(stderr_history) if stderr_history else info_step["stderr"]
+        log_lines = _build_log_lines(
+            final_code, info_step, reward, terminated, truncated,
+            num_regenerations, num_finishes, num_code_blocks,
+            stderr_override=stderr,
+        )
+
+        code_path = _save_trial_artifacts(
             config, trial, info_step["sandbox_rc"], reward,
             info_step.get("task_completed", False), final_code, raw_code,
-            all_responses, ["-" * 100, "Generated program:", final_code],
-            visual_feedback_imgs,
+            all_responses, log_lines, visual_feedback_imgs,
+            ensemble_data=ensemble_data,
+            multiturn_ensemble_data=multiturn_ensemble_data,
         )
 
-        # Only save intermediate video if NOT doing per-turn saving
-        # (per-turn saving is deferred to after the loop to avoid clearing the buffer)
-        if not recording_frames:
-            _save_trial_video(
-                env, config, trial, info_step, reward, len(code_blocks),
-                suffix_extra=str(len(code_blocks)),
+        # Save per-turn and combined videos
+        if recording_frames and turn_frame_ranges:
+            _save_turn_and_combined_videos(
+                env, config, trial, info_step, reward, turn_frame_ranges,
             )
+        else:
+            _save_trial_video(env, config, trial, info_step, reward, num_code_blocks)
 
-    print("Code blocks done")
+        success = info_step["sandbox_rc"] == 0
 
-    # --- 5. Build final summary ---
-    final_code = _annotate_code_blocks(code_blocks, code_block_metadata)
-    num_code_blocks = len(code_blocks)
+        # --- Evolving skill library integration (opt-in) ---
+        if config.get("evolve_skill_library", False) and info_step.get("task_completed", False):
+            try:
+                from capx.skills import SkillLibrary
 
-    if partial_artifacts is not None:
-        partial_artifacts["final_code"] = final_code
-        partial_artifacts["num_code_blocks"] = num_code_blocks
+                skill_lib_path = config.get("skill_library_path", None)
+                skill_lib = SkillLibrary(path=skill_lib_path)
+                task_name = config.get("task_name", f"trial_{trial}")
+                new_skills = skill_lib.extract_from_code(final_code, task_name=task_name)
+                skill_lib.save()
+                if new_skills:
+                    print(f"[SkillLibrary] Extracted {len(new_skills)} new skill(s): {new_skills}")
+            except Exception as exc:
+                print(f"[SkillLibrary] Skill extraction failed: {exc}")
 
-    # Override sandbox_rc for terminated-episode stderr
-    if "executing action in terminated episode" in info_step["stderr"]:
-        sandbox_rc_override = 0
-    if sandbox_rc_override is not None:
-        info_step["sandbox_rc"] = sandbox_rc_override
+        print(f"Trial {trial} took {time.time() - trial_start_time:.2f} seconds")
 
-    stderr = "\n\n".join(stderr_history) if stderr_history else info_step["stderr"]
-    log_lines = _build_log_lines(
-        final_code, info_step, reward, terminated, truncated,
-        num_regenerations, num_finishes, num_code_blocks,
-        stderr_override=stderr,
-    )
+        gc.collect()
 
-    code_path = _save_trial_artifacts(
-        config, trial, info_step["sandbox_rc"], reward,
-        info_step.get("task_completed", False), final_code, raw_code,
-        all_responses, log_lines, visual_feedback_imgs,
-        ensemble_data=ensemble_data,
-        multiturn_ensemble_data=multiturn_ensemble_data,
-    )
-
-    # Save per-turn and combined videos
-    if recording_frames and turn_frame_ranges:
-        _save_turn_and_combined_videos(
-            env, config, trial, info_step, reward, turn_frame_ranges,
+        return TrialSummary(
+            trial=trial,
+            success=success,
+            reward=reward,
+            terminated=terminated,
+            truncated=truncated,
+            sandbox_rc=info_step["sandbox_rc"],
+            log="\n".join(log_lines),
+            task_completed=info_step.get("task_completed", None),
+            code_path=code_path,
+            num_regenerations=num_regenerations,
+            num_finishes=num_finishes,
+            num_code_blocks=num_code_blocks,
         )
-    else:
-        _save_trial_video(env, config, trial, info_step, reward, num_code_blocks)
-
-    success = info_step["sandbox_rc"] == 0
-
-    # --- Evolving skill library integration (opt-in) ---
-    if config.get("evolve_skill_library", False) and info_step.get("task_completed", False):
-        try:
-            from capx.skills import SkillLibrary
-
-            skill_lib_path = config.get("skill_library_path", None)
-            skill_lib = SkillLibrary(path=skill_lib_path)
-            task_name = config.get("task_name", f"trial_{trial}")
-            new_skills = skill_lib.extract_from_code(final_code, task_name=task_name)
-            skill_lib.save()
-            if new_skills:
-                print(f"[SkillLibrary] Extracted {len(new_skills)} new skill(s): {new_skills}")
-        except Exception as exc:
-            print(f"[SkillLibrary] Skill extraction failed: {exc}")
-
-    print(f"Trial {trial} took {time.time() - trial_start_time:.2f} seconds")
-
-    gc.collect()
-
-    return TrialSummary(
-        trial=trial,
-        success=success,
-        reward=reward,
-        terminated=terminated,
-        truncated=truncated,
-        sandbox_rc=info_step["sandbox_rc"],
-        log="\n".join(log_lines),
-        task_completed=info_step.get("task_completed", None),
-        code_path=code_path,
-        num_regenerations=num_regenerations,
-        num_finishes=num_finishes,
-        num_code_blocks=num_code_blocks,
-    )
+    finally:
+        if collector is not None and episode_handle is not None:
+            try:
+                if hasattr(env, "low_level_env"):
+                    env.low_level_env.attach_step_recorder(None)
+                _kept = collector.finish_episode(
+                    episode_handle,
+                    success=bool(info_step.get("task_completed", False)),
+                    terminal_reward=float(reward),
+                    info={
+                        "sandbox_rc": info_step.get("sandbox_rc"),
+                        "num_code_blocks": len(code_blocks),
+                        "num_regenerations": num_regenerations,
+                        "num_finishes": num_finishes,
+                        "llm_model": args.model,
+                        "used_oracle_code": config.get("use_oracle_code", False),
+                        "config_path": args.config_path,
+                    },
+                )
+                print(
+                    f"[robodm] trial {trial}: "
+                    f"{'kept' if _kept else 'dropped'} "
+                    f"(success={info_step.get('task_completed', False)})"
+                )
+            except Exception as _e:
+                print(f"[robodm] finish_episode failed: {_e}")
 
 
 def _patch_libero_goal(env: CodeExecutionEnvBase, obs: dict[str, Any]) -> None:

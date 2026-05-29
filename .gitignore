@@ -12,6 +12,7 @@ env/
 .nvinferencekeys
 .capx_skills.json
 .pytest_cache/
+demos/
 .ruff_cache/
 
 scripts/nv_*

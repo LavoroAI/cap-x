@@ -22,7 +22,7 @@ from capx.envs.simulators.robosuite_base import RobosuiteBaseEnv
 class FrankaRobosuiteCubeLiftLowLevel(RobosuiteBaseEnv):
     """Robosuite Franka Cube Lift environment with FrankaPickPlaceLowLevel-compatible interface."""
 
-    _SUBSAMPLE_RATE = 2
+    _SUBSAMPLE_RATE = 1
 
     def __init__(
         self,

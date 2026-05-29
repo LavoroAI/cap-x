@@ -54,6 +54,9 @@ dependencies = [
   "opencv-python-headless",
   "pillow>=10",
   "cloudpickle",
+  "robodm>=0.1.0",
+  "av<=13.1.0",    # required by robodm for proper encoding/decoding
+  "rerun-sdk>=0.33.0",
 ]
 
 [project.optional-dependencies]
