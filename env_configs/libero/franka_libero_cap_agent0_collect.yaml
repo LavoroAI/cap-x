@@ -1,6 +1,16 @@
-# environment config with CaP-Agent0 settings
-# Usage:
-#   uv run capx/envs/launch.py --config-path env_configs/libero/franka_libero_cap_agent0.yaml
+# VLA data-collection variant of franka_libero_cap_agent0.
+#
+# Collects with the MOST CAPABLE AGENT (CaP-Agent0): vision-based, non-privileged,
+# multi-model ensemble + image differencing. The LLM agent generates the code for
+# each trial — LIBERO defines NO oracle code, so run this WITHOUT --use-oracle-code.
+#
+# Runs to a per-task QUOTA of successful `.vla` files, not a fixed trial count.
+#
+# Multi-task sweep (all tasks in the suite(s) listed under `collect.libero_suites`):
+#   uv run capx/envs/collect_data.py --config-path env_configs/libero/franka_libero_cap_agent0_collect.yaml --multi-task libero
+#
+# Note: suite_name / task_id / language_instruction are filled in per task by
+# `capx.data.curriculum.build_libero_curriculum` — the values below are placeholders.
 
 env:
   _target_: capx.envs.tasks.franka.franka_libero_env.FrankaLiberoCodeEnv
@@ -8,8 +18,8 @@ env:
     _target_: capx.envs.tasks.base.CodeExecEnvConfig
     low_level:
       _target_: capx.envs.simulators.libero.FrankaLiberoEnv
-      suite_name: libero_spatial
-      task_id: 0
+      suite_name: libero_spatial      # placeholder; overridden per task by curriculum
+      task_id: 0                       # placeholder; overridden per task by curriculum
       privileged: false
       max_steps: 8000
       control_freq: 20
@@ -57,11 +67,34 @@ api_servers:
     port: 8114
     host: 127.0.0.1
 
-record_video: true
-output_dir: ./outputs/franka_libero_cap_agent0
+# Eval debug artifacts (generated code, logs) still go to outputs/.
+output_dir: ./outputs/franka_libero_cap_agent0_collect
+
+# Debug MP4s not needed during collection; the .vla file already has the RGB stream.
+record_video: false
+
+# Capable-agent settings (mirror franka_libero_cap_agent0).
 use_img_differencing: true
 use_parallel_ensemble: true
 use_multimodel: true
 
-trials: 50
-num_workers: 10
+# Conservative throughput: each trial runs a multi-model LLM ensemble, so keep
+# parallelism modest. collect: stops earlier when target_successes is reached.
+trials: 30
+num_workers: 4
+
+collect:
+  output_root: ./demos
+  libero_suites:
+    - libero_spatial               # suite(s) to sweep with --multi-task libero
+  # task_id and language_instruction are filled in by build_libero_curriculum.
+  language_instruction: ""         # falls back to each task's LIBERO language
+  target_successes: 1
+  max_trials: 10
+  keep_failures: false
+  record_hz: 20.0   # record every sim step (control_freq); 20fps in rerun. Lower (e.g. 10) to shrink files.
+  video_codec: libx264
+  codec_options:
+    crf: 23
+    preset: veryfast
+  log_system_stats: false

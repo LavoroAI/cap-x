@@ -1,6 +1,7 @@
-# environment config with CaP-Agent0 settings
-# Usage:
-#   uv run capx/envs/launch.py --config-path env_configs/libero/franka_libero_cap_agent0.yaml
+# LIBERO Spatial Task 0: pick up the black bowl between the plate and the ramekin
+# Change suite_name and task_id in low_level to run different tasks.
+# Available suites: libero_10, libero_90, libero_object, libero_spatial, libero_goal
+# Use: python capx/envs/launch.py --config-path env_configs/libero/franka_libero_spatial_0.yaml --web-ui True
 
 env:
   _target_: capx.envs.tasks.franka.franka_libero_env.FrankaLiberoCodeEnv
@@ -9,13 +10,10 @@ env:
     low_level:
       _target_: capx.envs.simulators.libero.FrankaLiberoEnv
       suite_name: libero_spatial
-      task_id: 0
-      privileged: false
-      max_steps: 8000
-      control_freq: 20
+      task_id: 10
     privileged: false
     apis:
-      - FrankaLiberoApiReducedSkillLibrary
+      - FrankaLiberoApi
     prompt: |
       You are controlling a Franka Emika robot with API described below.
       Goal: {libero_environment_goal}
@@ -47,7 +45,7 @@ api_servers:
     host: 127.0.0.1
     robot: panda_description
     target_link: panda_hand
-
+  
   - _target_: capx.serving.launch_contact_graspnet_server.main
     port: 8115
     host: 127.0.0.1
@@ -58,10 +56,7 @@ api_servers:
     host: 127.0.0.1
 
 record_video: true
-output_dir: ./outputs/franka_libero_cap_agent0
-use_img_differencing: true
-use_parallel_ensemble: true
-use_multimodel: true
+output_dir: ./outputs/franka_libero_spatial_1
 
-trials: 50
+trials: 10
 num_workers: 10

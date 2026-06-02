@@ -288,7 +288,7 @@ def build_libero_curriculum(
     ``suite_names`` defaults to all suites in ``base_config['libero_suites']``
     or, failing that, to the suite already configured in ``cfg.low_level``.
     """
-    from libero.libero import benchmark  # type: ignore[import-not-found]
+    from libero import benchmark  # type: ignore[import-not-found]
 
     if suite_names is None:
         suite_names = (
@@ -324,7 +324,7 @@ def build_libero_curriculum(
         else collect_block.get("keep_failures", False)
     )
 
-    benchmark_dict = benchmark.get_benchmark_dict()
+    benchmark_dict = benchmark.get_benchmark_dict(help=False)
     tasks: list[CurriculumTask] = []
     for suite_name in suite_names:
         if suite_name not in benchmark_dict:

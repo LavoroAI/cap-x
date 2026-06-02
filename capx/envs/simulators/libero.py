@@ -83,7 +83,7 @@ class FrankaLiberoEnv(BaseEnv):
         self._wrist_frame_buffer: list[np.ndarray] = []
         self._record_wrist_camera = False
         self._wrist_camera_name = "robot0_eye_in_hand"
-        self._subsample_rate = 1
+        self._subsample_rate = 4
         self._full_viser_rate = 20  # Full scene update every 20 steps (cameras + pointcloud)
 
         # Robot link indices for transforms

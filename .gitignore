@@ -14,6 +14,7 @@ env/
 .pytest_cache/
 demos/
 .ruff_cache/
+*pdf
 
 scripts/nv_*
 # Build

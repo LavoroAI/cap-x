@@ -1,0 +1,101 @@
+# VLA data-collection variant using a SIMPLE S2 agent.
+#
+# Collects with a simple System-2 LLM agent: vision-based, non-privileged, single
+# model, no ensemble / image-differencing. Uses the full FrankaLiberoApi skill
+# library (cf. franka_libero_spatial_0). The LLM agent generates the code for each
+# trial — LIBERO defines NO oracle code, so run this WITHOUT --use-oracle-code.
+#
+# Runs to a per-task QUOTA of successful `.vla` files, not a fixed trial count.
+#
+# Multi-task sweep (all tasks in the suite(s) listed under `collect.libero_suites`):
+#   uv run capx/envs/collect_data.py --config-path env_configs/libero/franka_libero_s2_agent_collect.yaml --multi-task libero
+#
+# Note: suite_name / task_id / language_instruction are filled in per task by
+# `capx.data.curriculum.build_libero_curriculum` — the values below are placeholders.
+
+env:
+  _target_: capx.envs.tasks.franka.franka_libero_env.FrankaLiberoCodeEnv
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level:
+      _target_: capx.envs.simulators.libero.FrankaLiberoEnv
+      suite_name: libero_spatial      # placeholder; overridden per task by curriculum
+      task_id: 0                       # placeholder; overridden per task by curriculum
+      privileged: false
+      max_steps: 8000
+      control_freq: 20
+    privileged: false
+    apis:
+      - FrankaLiberoApi
+    prompt: |
+      You are controlling a Franka Emika robot with API described below.
+      Goal: {libero_environment_goal}
+      You may write python code comments for reasoning but ONLY write the executable Python code and do not write it in code fences.
+      After this code executes, you will be able to get a new observation of the environment and write new code to complete the task if needed.
+      The functions (APIs) below are already imported to the environment. If you want to use numpy, you need to import it explicitly.
+
+    multi_turn_prompt: |
+      The following code blocks were just executed:
+      ```python
+      {executed_code}
+      ```
+      The current console stdout is:
+      ```
+      {console_stdout}
+      ```
+      The current console stderr is:
+      ```
+      {console_stderr}
+      ```
+      If there were no errors during compilation or execution, the console stderr will be empty. If there were errors, consider regenerating the code.
+      Please respond with EXACTLY ONE of the following:
+      - The word 'REGENERATE' followed immediately by new Python code in a fenced code block (```python...```) if you want to modify the code.
+      - The word 'FINISH' if the task appears to be complete
+
+api_servers:
+  - _target_: capx.serving.launch_pyroki_server.main
+    port: 8116
+    host: 127.0.0.1
+    robot: panda_description
+    target_link: panda_hand
+
+  - _target_: capx.serving.launch_contact_graspnet_server.main
+    port: 8115
+    host: 127.0.0.1
+
+  - _target_: capx.serving.launch_sam3_server.main
+    device: cuda
+    port: 8114
+    host: 127.0.0.1
+
+# Eval debug artifacts (generated code, logs) still go to outputs/.
+output_dir: ./outputs/franka_libero_s2_agent_collect
+
+# Debug MP4s not needed during collection; the .vla file already has the RGB stream.
+record_video: true
+
+# Simple S2 agent: single model, no ensemble / image-differencing.
+use_img_differencing: false
+use_parallel_ensemble: false
+use_multimodel: false
+
+# Higher throughput than the capable agent: a single-model trial is cheaper, so we
+# can afford more parallelism. collect: stops earlier when target_successes is reached.
+trials: 50
+num_workers: 10
+
+collect:
+  output_root: ./demos
+  libero_suites:
+    - libero_spatial               # suite(s) to sweep with --multi-task libero
+  # task_id and language_instruction are filled in by build_libero_curriculum.
+  language_instruction: ""         # falls back to each task's LIBERO language
+  target_successes: 1
+  max_trials: 10
+  keep_failures: false
+  record_hz: 20.0   # record every sim step (control_freq); 20fps in rerun. Lower (e.g. 10) to shrink files.
+  video_codec: libx264
+  codec_options:
+    crf: 23
+    preset: veryfast
+  log_system_stats: false
